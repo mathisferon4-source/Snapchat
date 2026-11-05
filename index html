@@ -1,0 +1,843 @@
+# SNAP INTELLIGENCE
+# Script unique de création du projet
+# Windows PowerShell
+
+$ErrorActionPreference = "Stop"
+
+New-Item -ItemType Directory -Force "snap-intelligence\backend" | Out-Null
+New-Item -ItemType Directory -Force "snap-intelligence\frontend\src" | Out-Null
+Set-Location "snap-intelligence"
+
+@'
+fastapi
+uvicorn[standard]
+httpx
+reportlab
+'@ | Set-Content "backend\requirements.txt" -Encoding UTF8
+
+@'
+import os
+import sqlite3
+import json
+from datetime import datetime, timezone
+from io import BytesIO
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+
+app = FastAPI(title="SNAP INTELLIGENCE API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"]
+)
+
+DB = os.path.join(os.path.dirname(__file__), "snap_intelligence.db")
+
+def connect():
+    db = sqlite3.connect(DB)
+    db.row_factory = sqlite3.Row
+    return db
+
+def initialize():
+    db = connect()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            result TEXT NOT NULL
+        )
+    """)
+    db.commit()
+    db.close()
+
+initialize()
+
+class SearchRequest(BaseModel):
+    username: str = Field(min_length=2, max_length=50)
+    mode: str = "quick"
+    max_results: int = Field(default=10, ge=1, le=20)
+    modules: list[str] = [
+        "username_search",
+        "social_search",
+        "web_footprint"
+    ]
+
+async def public_search(query, maximum):
+    key = os.getenv("BRAVE_API_KEY")
+    if not key:
+        return {
+            "available": False,
+            "message": "Clé BRAVE_API_KEY non configurée.",
+            "results": []
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": maximum},
+                headers={
+                    "Accept": "application/json",
+                    "X-Subscription-Token": key
+                }
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        results = []
+        for item in data.get("web", {}).get("results", []):
+            results.append({
+                "title": item.get("title", "Sans titre"),
+                "url": item.get("url", ""),
+                "description": item.get("description", ""),
+                "confidence": "Correspondance possible",
+                "verified": False
+            })
+
+        return {
+            "available": True,
+            "message": "Résultats issus du web public.",
+            "results": results
+        }
+
+    except Exception:
+        return {
+            "available": False,
+            "message": "Recherche temporairement indisponible.",
+            "results": []
+        }
+
+@app.get("/")
+def home():
+    return {"name": "SNAP INTELLIGENCE", "status": "online"}
+
+@app.get("/api/status")
+def status():
+    return {"status": "online"}
+
+@app.post("/api/analyze")
+async def analyze(request: SearchRequest):
+    username = request.username.strip().lstrip("@")
+
+    if not username or any(c.isspace() for c in username):
+        raise HTTPException(400, "Pseudo invalide.")
+
+    modules = {}
+    results = []
+
+    if "username_search" in request.modules:
+        modules["username_search"] = await public_search(
+            f'"{username}"',
+            request.max_results
+        )
+
+    if "social_search" in request.modules:
+        modules["social_search"] = await public_search(
+            f'"{username}" site:instagram.com OR site:tiktok.com OR site:x.com',
+            request.max_results
+        )
+
+    if "web_footprint" in request.modules:
+        modules["web_footprint"] = await public_search(
+            f'"{username}"',
+            request.max_results
+        )
+
+    if "public_profile" in request.modules:
+        modules["public_profile"] = {
+            "available": False,
+            "message": "Aucun accès direct aux profils Snapchat. Seules les pages publiques indexées peuvent être recherchées."
+        }
+
+    for module in modules.values():
+        results.extend(module.get("results", []))
+
+    unique = {}
+    for item in results:
+        if item.get("url"):
+            unique[item["url"]] = item
+
+    results = list(unique.values())[:request.max_results]
+
+    report = {
+        "username": username,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "mode": request.mode,
+        "modules": modules,
+        "results": results,
+        "result_count": len(results),
+        "notice": "Une correspondance de pseudo ne prouve pas l'identité d'une personne."
+    }
+
+    db = connect()
+    cursor = db.execute(
+        "INSERT INTO reports(username, created_at, result) VALUES (?, ?, ?)",
+        (
+            username,
+            report["created_at"],
+            json.dumps(report, ensure_ascii=False)
+        )
+    )
+    report["id"] = cursor.lastrowid
+    db.commit()
+    db.close()
+
+    return report
+
+@app.get("/api/history")
+def history():
+    db = connect()
+    rows = db.execute(
+        "SELECT id, username, created_at FROM reports ORDER BY id DESC LIMIT 50"
+    ).fetchall()
+    db.close()
+    return [dict(row) for row in rows]
+
+@app.delete("/api/history")
+def clear_history():
+    db = connect()
+    db.execute("DELETE FROM reports")
+    db.commit()
+    db.close()
+    return {"message": "Historique supprimé."}
+
+@app.get("/api/reports/{report_id}")
+def get_report(report_id: int):
+    db = connect()
+    row = db.execute(
+        "SELECT result FROM reports WHERE id = ?",
+        (report_id,)
+    ).fetchone()
+    db.close()
+
+    if not row:
+        raise HTTPException(404, "Rapport introuvable.")
+
+    return json.loads(row["result"])
+
+@app.get("/api/reports/{report_id}/json")
+def export_json(report_id: int):
+    report = get_report(report_id)
+    content = json.dumps(report, ensure_ascii=False, indent=2)
+
+    return StreamingResponse(
+        BytesIO(content.encode("utf-8")),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f"attachment; filename=rapport-{report_id}.json"
+        }
+    )
+
+@app.get("/api/reports/{report_id}/pdf")
+def export_pdf(report_id: int):
+    report = get_report(report_id)
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    y = height - 50
+
+    pdf.setFont("Helvetica-Bold", 18)
+    pdf.drawString(45, y, "SNAP INTELLIGENCE")
+    y -= 35
+
+    pdf.setFont("Helvetica", 10)
+    lines = [
+        "Rapport de recherche publique",
+        f"Pseudo : {report['username']}",
+        f"Date : {report['created_at']}",
+        f"Resultats : {report['result_count']}",
+        "",
+        "Une correspondance de pseudo ne prouve pas une identite.",
+        "",
+        "RESULTATS"
+    ]
+
+    for line in lines:
+        pdf.drawString(45, y, line)
+        y -= 17
+
+    for item in report["results"]:
+        if y < 80:
+            pdf.showPage()
+            y = height - 50
+            pdf.setFont("Helvetica", 10)
+
+        for line in [
+            item.get("title", "")[:90],
+            item.get("url", "")[:100],
+            item.get("description", "")[:120],
+            ""
+        ]:
+            pdf.drawString(45, y, line)
+            y -= 15
+
+    pdf.save()
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename=rapport-{report_id}.pdf"
+        }
+    )
+'@ | Set-Content "backend\main.py" -Encoding UTF8
+
+@'
+{
+  "name": "snap-intelligence",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "lucide-react": "^0.468.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.5"
+  }
+}
+'@ | Set-Content "frontend\package.json" -Encoding UTF8
+
+@'
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SNAP INTELLIGENCE</title>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="/src/main.jsx"></script>
+</body>
+</html>
+'@ | Set-Content "frontend\index.html" -Encoding UTF8
+
+@'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  server: { port: 5173 }
+});
+'@ | Set-Content "frontend\vite.config.js" -Encoding UTF8
+
+@'
+import React, { useEffect, useState } from "react";
+import { createRoot } from "react-dom/client";
+import {
+  Search, Shield, Activity, Globe, Users,
+  FileText, Trash2, Download, ExternalLink,
+  Clock, AlertTriangle, LoaderCircle
+} from "lucide-react";
+import "./style.css";
+
+const API = "http://127.0.0.1:8000";
+
+function App() {
+  const [username, setUsername] = useState("");
+  const [mode, setMode] = useState("quick");
+  const [loading, setLoading] = useState(false);
+  const [results, setResults] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [error, setError] = useState("");
+  const [maxResults, setMaxResults] = useState(10);
+
+  const [modules, setModules] = useState({
+    username_search: true,
+    public_profile: true,
+    social_search: true,
+    web_footprint: true
+  });
+
+  async function loadHistory() {
+    try {
+      const response = await fetch(`${API}/api/history`);
+      if (response.ok) setHistory(await response.json());
+    } catch {
+      setHistory([]);
+    }
+  }
+
+  useEffect(() => {
+    loadHistory();
+  }, []);
+
+  function toggle(name) {
+    setModules(old => ({ ...old, [name]: !old[name] }));
+  }
+
+  async function analyze() {
+    if (username.trim().length < 2) {
+      setError("Entre un pseudo valide.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    setResults(null);
+
+    try {
+      const response = await fetch(`${API}/api/analyze`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username,
+          mode,
+          max_results: Number(maxResults),
+          modules: Object.keys(modules).filter(key => modules[key])
+        })
+      });
+
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Erreur de recherche.");
+
+      setResults(data);
+      loadHistory();
+    } catch (e) {
+      setError(e.message || "Impossible de contacter le serveur.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function clearHistory() {
+    if (!confirm("Supprimer tout l'historique ?")) return;
+    await fetch(`${API}/api/history`, { method: "DELETE" });
+    setHistory([]);
+  }
+
+  function exportFile(type) {
+    if (results?.id) {
+      window.open(`${API}/api/reports/${results.id}/${type}`, "_blank");
+    }
+  }
+
+  async function openHistory(id) {
+    const response = await fetch(`${API}/api/reports/${id}`);
+    if (response.ok) setResults(await response.json());
+  }
+
+  return (
+    <div className="app">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-icon"><Shield /></div>
+          <div>
+            <h2>SNAP<span>INTELLIGENCE</span></h2>
+            <small>PUBLIC SEARCH PLATFORM</small>
+          </div>
+        </div>
+
+        <div className="menu-label">NAVIGATION</div>
+        <a className="active"><Activity size={18}/> Dashboard</a>
+        <a href="#search"><Search size={18}/> Recherche</a>
+        <a href="#history"><Clock size={18}/> Historique</a>
+
+        <div className="sidebar-bottom">
+          <div className="secure">
+            <Shield size={19}/>
+            <div>
+              <strong>Recherche publique</strong>
+              <small>Aucun accès privé</small>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <main className="main">
+        <header className="topbar">
+          <div>
+            <div className="eyebrow">CENTRE DE RECHERCHE</div>
+            <h1>Dashboard</h1>
+          </div>
+          <div className="status"><span/> SYSTEM ONLINE</div>
+        </header>
+
+        <section className="welcome">
+          <div>
+            <div className="eyebrow">SNAP INTELLIGENCE / 01</div>
+            <h2>Explore les traces <span>publiques.</span></h2>
+            <p>Recherche des occurrences de pseudonymes sur les sources accessibles publiquement.</p>
+          </div>
+          <div className="welcome-icon"><Globe size={55}/></div>
+        </section>
+
+        <section className="stats">
+          <div className="stat-card">
+            <div className="stat-icon purple"><Search/></div>
+            <div><small>RECHERCHES ENREGISTRÉES</small><h2>{history.length}</h2></div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-icon blue"><Shield/></div>
+            <div><small>MODE DE RECHERCHE</small><h2>PUBLIC</h2></div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-icon green"><Activity/></div>
+            <div><small>ÉTAT DU SYSTÈME</small><h2>EN LIGNE</h2></div>
+          </div>
+        </section>
+
+        <section className="panel" id="search">
+          <div className="panel-heading">
+            <div>
+              <div className="eyebrow">MODULE PRINCIPAL</div>
+              <h2><Search size={21}/> Recherche de pseudo</h2>
+            </div>
+            <span className="tag">PUBLIC DATA ONLY</span>
+          </div>
+
+          <label>PSEUDO À RECHERCHER</label>
+          <div className="searchbar">
+            <Search/>
+            <input
+              value={username}
+              onChange={e => setUsername(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && analyze()}
+              placeholder="Entre un pseudo..."
+            />
+            <button onClick={analyze} disabled={loading}>
+              {loading ? <LoaderCircle className="spin"/> : <Search size={17}/>}
+              {loading ? "RECHERCHE..." : "LANCER L'ANALYSE"}
+            </button>
+          </div>
+
+          <div className="settings-grid">
+            <div>
+              <label>PROFONDEUR</label>
+              <select value={mode} onChange={e => setMode(e.target.value)}>
+                <option value="quick">Recherche rapide</option>
+                <option value="deep">Recherche approfondie</option>
+              </select>
+            </div>
+            <div>
+              <label>NOMBRE MAXIMUM DE RÉSULTATS</label>
+              <select value={maxResults} onChange={e => setMaxResults(e.target.value)}>
+                <option value="5">5 résultats</option>
+                <option value="10">10 résultats</option>
+                <option value="20">20 résultats</option>
+              </select>
+            </div>
+          </div>
+
+          <label>MODULES À ACTIVER</label>
+          <div className="modules">
+            <label className="module">
+              <input type="checkbox" checked={modules.username_search} onChange={() => toggle("username_search")}/>
+              <Search/><span>USERNAME SEARCH</span>
+            </label>
+            <label className="module">
+              <input type="checkbox" checked={modules.public_profile} onChange={() => toggle("public_profile")}/>
+              <Users/><span>PUBLIC PROFILE</span>
+            </label>
+            <label className="module">
+              <input type="checkbox" checked={modules.social_search} onChange={() => toggle("social_search")}/>
+              <Globe/><span>SOCIAL SEARCH</span>
+            </label>
+            <label className="module">
+              <input type="checkbox" checked={modules.web_footprint} onChange={() => toggle("web_footprint")}/>
+              <FileText/><span>WEB FOOTPRINT</span>
+            </label>
+          </div>
+
+          {error && <div className="error">{error}</div>}
+        </section>
+
+        {results && (
+          <section className="panel">
+            <div className="panel-heading">
+              <div>
+                <div className="eyebrow">RAPPORT D'ANALYSE</div>
+                <h2>Résultats : {results.username}</h2>
+              </div>
+              <div className="export-buttons">
+                <button className="secondary" onClick={() => exportFile("json")}><Download size={15}/> JSON</button>
+                <button className="secondary" onClick={() => exportFile("pdf")}><Download size={15}/> PDF</button>
+              </div>
+            </div>
+
+            <div className="notice">
+              <AlertTriangle size={18}/>
+              {results.notice}
+            </div>
+
+            <p className="result-count">{results.result_count} résultat(s) trouvé(s)</p>
+
+            {results.results.length === 0 && (
+              <p className="empty">Aucun résultat public disponible.</p>
+            )}
+
+            {results.results.map((item, index) => (
+              <div className="result" key={item.url || index}>
+                <div className="result-top">
+                  <strong>{item.title}</strong>
+                  <span className="possible">Correspondance possible</span>
+                </div>
+                <p>{item.description}</p>
+                <a href={item.url} target="_blank" rel="noreferrer">
+                  Consulter la source <ExternalLink size={14}/>
+                </a>
+              </div>
+            ))}
+          </section>
+        )}
+
+        <section className="panel" id="history">
+          <div className="panel-heading">
+            <div>
+              <div className="eyebrow">ACTIVITÉ</div>
+              <h2><Clock size={20}/> Historique</h2>
+            </div>
+            <button className="secondary danger" onClick={clearHistory}>
+              <Trash2 size={15}/> Effacer
+            </button>
+          </div>
+
+          {history.length === 0 && <p className="empty">Aucune recherche enregistrée.</p>}
+
+          {history.map(item => (
+            <button className="history-item" key={item.id} onClick={() => openHistory(item.id)}>
+              <Search size={17}/>
+              <span>{item.username}</span>
+              <small>{new Date(item.created_at).toLocaleString("fr-FR")}</small>
+            </button>
+          ))}
+        </section>
+
+        <footer>
+          SNAP INTELLIGENCE — Recherche limitée aux informations publiques.
+          Respecte la vie privée et les conditions des sites consultés.
+        </footer>
+      </main>
+    </div>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<App/>);
+'@ | Set-Content "frontend\src\main.jsx" -Encoding UTF8
+
+@'
+:root {
+  font-family: Inter, Segoe UI, Arial, sans-serif;
+  color: #f3f0ff;
+  background: #090711;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: #090711; }
+button, input, select { font: inherit; }
+.app { min-height: 100vh; }
+.sidebar {
+  width: 250px;
+  position: fixed;
+  inset: 0 auto 0 0;
+  background: #100d1c;
+  border-right: 1px solid #28213c;
+  padding: 28px 18px;
+  display: flex;
+  flex-direction: column;
+  z-index: 2;
+}
+.brand { display: flex; align-items: center; gap: 12px; margin-bottom: 55px; }
+.brand-icon {
+  width: 43px; height: 43px; display: grid; place-items: center;
+  color: #b18aff; background: #281b45;
+  border: 1px solid #7047b5; border-radius: 13px;
+}
+.brand h2 { font-size: 13px; margin: 0; letter-spacing: 1px; }
+.brand h2 span { display: block; color: #a982ff; }
+.brand small { color: #827b98; font-size: 9px; }
+.menu-label, .eyebrow {
+  color: #8d82aa; font-size: 10px; letter-spacing: 2px; font-weight: 800;
+}
+.sidebar a {
+  text-decoration: none; color: #a49bb8; padding: 13px;
+  margin-top: 8px; display: flex; align-items: center;
+  gap: 12px; border-radius: 9px; font-size: 13px;
+}
+.sidebar a.active { color: #d9c6ff; background: #281c43; }
+.sidebar-bottom { margin-top: auto; }
+.secure {
+  border: 1px solid #34264c; background: #181226;
+  border-radius: 12px; padding: 14px;
+  display: flex; gap: 12px; color: #a88aff;
+}
+.secure strong, .secure small { display: block; }
+.secure strong { color: #e4dbf6; font-size: 11px; }
+.secure small { color: #8b829e; font-size: 10px; margin-top: 5px; }
+.main { margin-left: 250px; padding: 35px 5%; max-width: 1600px; }
+.topbar, .panel-heading {
+  display: flex; align-items: center; justify-content: space-between; gap: 15px;
+}
+h1 { font-size: 28px; margin: 8px 0 0; }
+h2 { font-size: 19px; }
+.status {
+  color: #8ee5bb; background: #10261f; border: 1px solid #285b46;
+  border-radius: 30px; padding: 9px 13px; font-size: 10px; letter-spacing: 1px;
+}
+.status span { display: inline-block; background: #58dc9c; width: 7px; height: 7px; border-radius: 50%; }
+.welcome {
+  margin-top: 35px; padding: 35px; border: 1px solid #392755;
+  border-radius: 17px; background: linear-gradient(115deg, #211633, #10182c);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.welcome h2 { font-size: 29px; margin: 12px 0; }
+.welcome h2 span { color: #ae87ff; }
+.welcome p { color: #aaa2bd; font-size: 13px; }
+.welcome-icon { color: #9970e8; opacity: .7; }
+.stats { display: grid; grid-template-columns: repeat(3,1fr); gap: 15px; margin: 20px 0; }
+.stat-card {
+  display: flex; align-items: center; gap: 15px;
+  background: #141020; border: 1px solid #29223b;
+  border-radius: 13px; padding: 18px;
+}
+.stat-card small { color: #948aa9; font-size: 9px; letter-spacing: 1px; }
+.stat-card h2 { margin: 7px 0 0; font-size: 18px; }
+.stat-icon {
+  width: 42px; height: 42px; border-radius: 11px;
+  display: grid; place-items: center;
+}
+.purple { color: #b18aff; background: #2b1d45; }
+.blue { color: #7daeff; background: #172c4a; }
+.green { color: #76dbac; background: #173a2b; }
+.panel {
+  background: #13101e; border: 1px solid #2b243d;
+  border-radius: 15px; padding: 25px; margin: 20px 0;
+}
+.panel-heading { margin-bottom: 25px; }
+.panel-heading h2 { display: flex; align-items: center; gap: 10px; margin-bottom: 0; }
+.tag {
+  color: #b99aff; background: #281b41; border: 1px solid #503777;
+  border-radius: 20px; padding: 7px 11px; font-size: 9px;
+}
+.panel label {
+  display: block; color: #9389a8; font-size: 10px;
+  letter-spacing: 1px; margin: 20px 0 9px;
+}
+.searchbar {
+  display: flex; align-items: center; gap: 12px;
+  background: #0c0a14; border: 1px solid #453263;
+  border-radius: 10px; padding: 8px 10px 8px 14px;
+}
+.searchbar > svg { color: #a88aff; }
+.searchbar input {
+  flex: 1; min-width: 0; background: transparent;
+  border: 0; outline: 0; color: white; padding: 10px;
+}
+button {
+  cursor: pointer; border: 0; border-radius: 8px;
+  background: #8153d5; color: white; padding: 12px 16px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  font-size: 11px; font-weight: 800;
+}
+button:hover { filter: brightness(1.15); }
+button:disabled { opacity: .6; cursor: wait; }
+.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+.settings-grid select {
+  width: 100%; padding: 12px; color: #eee;
+  background: #0c0a14; border: 1px solid #342b48; border-radius: 8px;
+}
+.modules { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; }
+.panel .module {
+  display: flex; align-items: center; gap: 8px;
+  background: #1b1628; border: 1px solid #332747;
+  padding: 12px; border-radius: 9px; margin: 0;
+  color: #c4b9da; font-size: 9px;
+}
+.module svg { color: #a88aff; width: 16px; }
+.module input { accent-color: #9a6aff; }
+.error { color: #ff9292; margin-top: 15px; font-size: 13px; }
+.notice {
+  display: flex; align-items: center; gap: 10px;
+  padding: 13px; background: #292018; color: #ffcf91;
+  border: 1px solid #61452a; border-radius: 9px; font-size: 12px;
+}
+.result-count, .empty { color: #9d94ad; font-size: 12px; }
+.result { padding: 17px 0; border-bottom: 1px solid #302840; }
+.result-top { display: flex; justify-content: space-between; gap: 10px; }
+.result strong { font-size: 13px; }
+.result p { color: #a9a0b9; font-size: 12px; }
+.result a {
+  color: #ae8aff; font-size: 11px; text-decoration: none;
+  display: inline-flex; align-items: center; gap: 5px;
+}
+.possible { color: #edc47b; font-size: 9px; }
+.secondary { background: #28213a; color: #c8b5ef; }
+.danger { color: #ff9b9b; }
+.export-buttons { display: flex; gap: 8px; }
+.history-item {
+  display: flex; width: 100%; justify-content: flex-start;
+  background: #1a1527; border: 1px solid #302640;
+  margin: 8px 0; text-align: left;
+}
+.history-item span { flex: 1; }
+.history-item small { color: #9b91aa; }
+footer { color: #716981; text-align: center; font-size: 10px; padding: 30px 0; }
+.spin { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media(max-width:900px) {
+  .sidebar { width: 75px; padding: 20px 10px; }
+  .brand { justify-content: center; }
+  .brand > div:last-child, .menu-label, .sidebar a:not(.active), .sidebar a.active { font-size: 0; }
+  .brand h2, .brand small, .secure div { display: none; }
+  .sidebar a { justify-content: center; }
+  .main { margin-left: 75px; padding: 25px 3%; }
+  .stats { grid-template-columns: 1fr; }
+  .modules { grid-template-columns: 1fr 1fr; }
+}
+@media(max-width:550px) {
+  .welcome { padding: 22px; }
+  .welcome h2 { font-size: 21px; }
+  .welcome-icon { display: none; }
+  .settings-grid { grid-template-columns: 1fr; }
+  .searchbar { flex-wrap: wrap; }
+  .searchbar button { width: 100%; }
+  .panel { padding: 17px; }
+  .panel-heading { align-items: flex-start; flex-direction: column; }
+  .status { display: none; }
+  .result-top { flex-direction: column; }
+}
+'@ | Set-Content "frontend\src\style.css" -Encoding UTF8
+
+# ---------------- INSTALLATION ----------------
+
+Write-Host "Installation des dépendances Python..." -ForegroundColor Cyan
+Set-Location backend
+python -m pip install -r requirements.txt
+Set-Location ..\frontend
+
+Write-Host "Installation des dépendances React..." -ForegroundColor Cyan
+npm install
+
+Set-Location ..
+
+Write-Host ""
+Write-Host "PROJET CREE AVEC SUCCES !" -ForegroundColor Green
+Write-Host "Pour lancer le backend :" -ForegroundColor Yellow
+Write-Host "cd backend"
+Write-Host "python -m uvicorn main:app --reload"
+Write-Host ""
+Write-Host "Pour lancer le frontend dans un autre terminal :" -ForegroundColor Yellow
+Write-Host "cd frontend"
+Write-Host "npm run dev"
+Write-Host ""
+Write-Host "Ouvre ensuite http://localhost:5173" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Pour activer la recherche web, configure BRAVE_API_KEY côté serveur."
+Write-Host "Les résultats sont des correspondances publiques, pas des identités vérifiées."
+'@ 
